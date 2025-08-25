@@ -2,422 +2,410 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import os
-import uuid
+from typing import List, Tuple, Optional, Dict, Any
 from .api_calls import (
     fetch_movie_metadata,
     fetch_poster,
     fetch_popular_movies,
     fetch_genres,
+    fetch_movies_by_genre,
 )
 
 
-def recommend_content_based(movie_title, movies, similarity):
-    if similarity is None or movies.empty:
-        st.error("Content-based recommendations unavailable due to missing data.")
-        return [], []
-    try:
-        index = movies[movies["title"] == movie_title].index[0]
-        distances = sorted(
-            list(enumerate(similarity[index])), reverse=True, key=lambda x: x[1]
-        )
-        recommended_names = []
-        recommended_posters = []
-        for i in distances[1:6]:
-            movie_id = movies.iloc[i[0]].id
-            recommended_names.append(movies.iloc[i[0]].title)
-            recommended_posters.append(fetch_poster(movie_id))
-        return recommended_names, recommended_posters
-    except IndexError:
-        st.error(f"Movie '{movie_title}' not found in the database.")
-        return [], []
-    except Exception as e:
-        st.error(f"Error generating content-based recommendations: {e}")
-        return [], []
+class RecommendationEngine:
+    def __init__(self, movies: pd.DataFrame, similarity: np.ndarray = None, svd_model = None):
+        self.movies = movies
+        self.similarity = similarity
+        self.svd_model = svd_model
+        self.mood_genres = {
+            "happy": [35, 10751, 16, 10402],
+            "sad": [18, 10749, 10402, 99],
+            "excited": [28, 12, 878, 53],
+            "relaxed": [99, 36, 14, 10751],
+            "scared": [27, 53, 9648, 28],
+            "romantic": [10749, 18, 35, 10402],
+            "adventurous": [12, 28, 14, 878],
+            "thoughtful": [18, 99, 36, 80]
+        }
 
+    def _validate_data(self, required_data: List[str]) -> bool:
+        validations = {
+            "movies": not self.movies.empty,
+            "similarity": self.similarity is not None,
+            "svd_model": self.svd_model is not None
+        }
+        return all(validations.get(data, True) for data in required_data)
 
-def recommend_content_based_tmdb(movie_title, movies, num_recommendations=5):
-    if movies.empty:
-        st.error("Content-based recommendations unavailable due to missing movie data.")
-        return [], []
+    def _get_movie_index(self, movie_title: str) -> Optional[int]:
+        indices = self.movies[self.movies["title"].str.lower() == movie_title.lower()].index
+        return indices[0] if len(indices) > 0 else None
 
-    try:
-        movie_id = (
-            movies[movies["title"] == movie_title]["id"].iloc[0]
-            if movie_title in movies["title"].values
-            else None
-        )
-        if not movie_id:
-            st.error(f"Movie '{movie_title}' not found.")
+    def _get_user_rated_movies(self, user_id: int) -> set:
+        try:
+            if not os.path.exists("user_reviews.csv"):
+                return set()
+            
+            reviews_df = pd.read_csv("user_reviews.csv")
+            user_reviews = reviews_df[reviews_df["user"].astype(str) == str(user_id)]
+            return set(user_reviews["movie_id"].astype(int))
+        except Exception:
+            return set()
+
+    def content_based_similarity(self, movie_title: str, num_recommendations: int = 5) -> Tuple[List[str], List[str]]:
+        if not self._validate_data(["movies", "similarity"]):
+            return self._fallback_recommendations()
+        
+        try:
+            index = self._get_movie_index(movie_title)
+            if index is None or index >= len(self.similarity):
+                st.error(f"Movie '{movie_title}' not found")
+                return self._fallback_recommendations()
+            
+            similarity_scores = list(enumerate(self.similarity[index]))
+            similarity_scores = sorted(similarity_scores, key=lambda x: x[1], reverse=True)
+            
+            recommendations = []
+            posters = []
+            
+            for idx, score in similarity_scores[1:num_recommendations + 1]:
+                if idx < len(self.movies):
+                    movie = self.movies.iloc[idx]
+                    recommendations.append(movie.get('title', 'Unknown'))
+                    posters.append(fetch_poster(movie.get('id', 0)))
+            
+            return recommendations, posters
+            
+        except Exception as e:
+            st.error(f"Content-based recommendation error: {e}")
+            return self._fallback_recommendations()
+
+    def content_based_tmdb(self, movie_title: str, num_recommendations: int = 5) -> Tuple[List[str], List[str]]:
+        if not self._validate_data(["movies"]):
+            return self._fallback_recommendations()
+
+        try:
+            movie_data = self.movies[self.movies["title"].str.lower() == movie_title.lower()]
+            if movie_data.empty:
+                return self._fallback_recommendations()
+            
+            target_id = movie_data["id"].iloc[0]
+            target_metadata = fetch_movie_metadata(target_id)
+            target_genres = set(target_metadata.get("genres", []))
+            
+            similarities = []
+            for _, movie in self.movies.iterrows():
+                if movie["title"].lower() == movie_title.lower():
+                    continue
+                
+                try:
+                    metadata = fetch_movie_metadata(movie["id"])
+                    genres = set(metadata.get("genres", []))
+                    
+                    jaccard_sim = self._calculate_jaccard_similarity(target_genres, genres)
+                    similarities.append((movie["id"], movie["title"], jaccard_sim))
+                except Exception:
+                    continue
+
+            similarities.sort(key=lambda x: x[2], reverse=True)
+            top_similarities = similarities[:num_recommendations]
+            
+            names = [title for _, title, _ in top_similarities]
+            posters = [fetch_poster(movie_id) for movie_id, _, _ in top_similarities]
+            
+            return names, posters
+
+        except Exception as e:
+            st.error(f"TMDB content-based error: {e}")
+            return self._fallback_recommendations()
+
+    def collaborative_filtering(self, user_id: int, num_recommendations: int = 5) -> Tuple[List[str], List[str]]:
+        if not self._validate_data(["movies", "svd_model"]):
+            return self._fallback_recommendations()
+        
+        try:
+            rated_movies = self._get_user_rated_movies(user_id)
+            predictions = []
+            
+            for _, movie in self.movies.iterrows():
+                movie_id = movie["id"]
+                if movie_id not in rated_movies:
+                    try:
+                        prediction = self.svd_model.predict(user_id, movie_id)
+                        predictions.append((movie_id, movie["title"], prediction.est))
+                    except Exception:
+                        continue
+
+            predictions.sort(key=lambda x: x[2], reverse=True)
+            top_predictions = predictions[:num_recommendations]
+            
+            names = [title for _, title, _ in top_predictions]
+            posters = [fetch_poster(movie_id) for movie_id, _, _ in top_predictions]
+            
+            return names, posters
+            
+        except Exception as e:
+            st.error(f"Collaborative filtering error: {e}")
+            return self._fallback_recommendations()
+
+    def hybrid_recommendations(self, movie_title: str, user_id: int, 
+                              content_weight: float = 0.6, collab_weight: float = 0.4) -> Tuple[List[str], List[str]]:
+        if not self._validate_data(["movies"]):
+            return self._fallback_recommendations()
+        
+        try:
+            content_names, content_posters = self.content_based_similarity(movie_title)
+            collab_names, collab_posters = self.collaborative_filtering(user_id)
+            
+            hybrid_movies = {}
+            
+            for i, name in enumerate(content_names):
+                score = content_weight * (len(content_names) - i) / len(content_names)
+                hybrid_movies[name] = {
+                    'score': score, 
+                    'poster': content_posters[i]
+                }
+            
+            for i, name in enumerate(collab_names):
+                score = collab_weight * (len(collab_names) - i) / len(collab_names)
+                if name in hybrid_movies:
+                    hybrid_movies[name]['score'] += score
+                else:
+                    hybrid_movies[name] = {
+                        'score': score, 
+                        'poster': collab_posters[i]
+                    }
+            
+            sorted_movies = sorted(hybrid_movies.items(), key=lambda x: x[1]['score'], reverse=True)[:5]
+            
+            names = [movie[0] for movie in sorted_movies]
+            posters = [movie[1]['poster'] for movie in sorted_movies]
+            
+            return names, posters
+            
+        except Exception as e:
+            st.error(f"Hybrid recommendation error: {e}")
+            return self._fallback_recommendations()
+
+    def mood_based_recommendations(self, mood_answers: Dict[str, Any]) -> Tuple[List[Dict], List[str]]:
+        try:
+            primary_mood = mood_answers.get("mood", "thoughtful")
+            time_available = mood_answers.get("time_available", "medium")
+            genre_preference = mood_answers.get("genre_preference", "")
+            avoid_content = mood_answers.get("avoid_content", [])
+            watching_with = mood_answers.get("watching_with", "alone")
+            energy = mood_answers.get("energy", "medium")
+            
+            # Determine target runtime based on time available
+            if "short" in time_available.lower():
+                target_runtime = (60, 90)
+            elif "long" in time_available.lower():
+                target_runtime = (120, 200)
+            else:  # medium
+                target_runtime = (90, 120)
+            
+            # Get genre IDs based on preference or mood
+            if genre_preference:
+                # Find genre ID by name
+                all_genres = fetch_genres()
+                genre_id = None
+                for gid, gname in all_genres.items():
+                    if gname.lower() == genre_preference.lower():
+                        genre_id = gid
+                        break
+                if genre_id:
+                    genre_ids = [genre_id]
+                else:
+                    genre_ids = self.mood_genres.get(primary_mood, [18])
+            else:
+                genre_ids = self.mood_genres.get(primary_mood, [18])
+            
+            # Adjust genres based on watching company
+            if watching_with == "kids":
+                # Filter out adult content genres
+                family_genres = [16, 10751]  # Animation, Family
+                genre_ids = [g for g in genre_ids if g in family_genres] or family_genres
+            elif watching_with == "family":
+                # Avoid very violent or scary content
+                avoid_genres = [27, 53, 80]  # Horror, Thriller, Crime
+                genre_ids = [g for g in genre_ids if g not in avoid_genres]
+            
+            recommendations = []
+            posters = []
+            movies_per_genre = max(1, 5 // len(genre_ids))
+            
+            for genre_id in genre_ids:
+                if len(recommendations) >= 5:
+                    break
+                    
+                try:
+                    genre_movies = fetch_movies_by_genre(genre_id, limit=movies_per_genre + 5)
+                    for movie in genre_movies:
+                        if len(recommendations) >= 5:
+                            break
+                            
+                        # Check if movie title is already recommended
+                        if any(movie["title"] == rec["title"] for rec in recommendations):
+                            continue
+                        
+                        # Check runtime constraints
+                        movie_runtime = movie.get("runtime", 120)
+                        if not (target_runtime[0] <= movie_runtime <= target_runtime[1]):
+                            continue
+                        
+                        # Check avoid content (basic filtering)
+                        movie_overview = movie.get("overview", "").lower()
+                        should_avoid = False
+                        for avoid in avoid_content:
+                            if avoid.lower() in movie_overview:
+                                should_avoid = True
+                                break
+                        
+                        if should_avoid:
+                            continue
+                        
+                        # Create movie object with all required fields
+                        movie_obj = {
+                            "id": movie.get("id", len(recommendations) + 1000),
+                            "title": movie["title"],
+                            "poster": movie["poster"],
+                            "rating": movie.get("rating", 7.5),
+                            "description": movie.get("overview", f"A great {primary_mood} movie!"),
+                            "runtime": movie_runtime,
+                            "release_date": movie.get("release_date", "2020-01-01"),
+                            "genres": movie.get("genres", [])
+                        }
+                        
+                        recommendations.append(movie_obj)
+                        posters.append(movie["poster"])
+                        
+                except Exception:
+                    continue
+            
+            # Always return a proper tuple
+            if recommendations:
+                return recommendations, posters
+            else:
+                fallback_names, fallback_posters = self._fallback_recommendations()
+                # Create fallback movie objects
+                fallback_movies = []
+                for i, (name, poster) in enumerate(zip(fallback_names, fallback_posters)):
+                    fallback_movies.append({
+                        "id": i + 1000,
+                        "title": name,
+                        "poster": poster,
+                        "rating": 7.5,
+                        "description": f"A great {primary_mood} movie for your mood!",
+                        "runtime": 120,
+                        "release_date": "2020-01-01",
+                        "genres": []
+                    })
+                return fallback_movies, fallback_posters
+            
+        except Exception as e:
+            fallback_names, fallback_posters = self._fallback_recommendations()
+            # Create fallback movie objects
+            fallback_movies = []
+            for i, (name, poster) in enumerate(zip(fallback_names, fallback_posters)):
+                fallback_movies.append({
+                    "id": i + 1000,
+                    "title": name,
+                    "poster": poster,
+                    "rating": 7.5,
+                    "description": "A great movie for your mood!",
+                    "runtime": 120,
+                    "release_date": "2020-01-01",
+                    "genres": []
+                })
+            return fallback_movies, fallback_posters
+
+    def genre_based_recommendations(self, genre_id: int, limit: int = 5) -> Tuple[List[str], List[str]]:
+        try:
+            genre_movies = fetch_movies_by_genre(genre_id, limit=limit * 2)
+            
+            if genre_movies:
+                movies_sample = genre_movies[:limit]
+                names = [movie["title"] for movie in movies_sample]
+                posters = [movie["poster"] for movie in movies_sample]
+                return names, posters
+            
+            return self._fallback_recommendations()
+            
+        except Exception:
+            return self._fallback_recommendations()
+
+    def get_user_profile(self, user_id: int) -> Dict[str, Any]:
+        try:
+            if not os.path.exists("user_reviews.csv"):
+                return {}
+            
+            reviews_df = pd.read_csv("user_reviews.csv")
+            user_reviews = reviews_df[reviews_df["user"].astype(str) == str(user_id)]
+            
+            if user_reviews.empty:
+                return {}
+            
+            profile = {
+                "total_reviews": len(user_reviews),
+                "average_rating": user_reviews["rating"].mean(),
+                "top_rated_movies": user_reviews.nlargest(5, "rating")["title"].tolist(),
+                "most_recent_movies": user_reviews.nlargest(5, "timestamp")["title"].tolist() 
+                if "timestamp" in user_reviews.columns else [],
+                "rating_distribution": user_reviews["rating"].value_counts().to_dict()
+            }
+            
+            return profile
+            
+        except Exception:
+            return {}
+
+    def _calculate_jaccard_similarity(self, set1: set, set2: set) -> float:
+        if not set1 and not set2:
+            return 0.0
+        intersection = len(set1.intersection(set2))
+        union = len(set1.union(set2))
+        return intersection / union if union > 0 else 0.0
+
+    def _fallback_recommendations(self) -> Tuple[List[str], List[str]]:
+        try:
+            popular_movies = fetch_popular_movies(limit=5)
+            if popular_movies:
+                names = [movie["title"] for movie in popular_movies]
+                posters = [movie["poster"] for movie in popular_movies]
+                return names, posters
+            return [], []
+        except Exception:
             return [], []
 
-        # Fetch metadata for the target movie
-        target_metadata = fetch_movie_metadata(movie_id)
-        target_genres = set(target_metadata["genres"])
 
-        # Compute similarities with other movies
-        similarities = []
-        for movie in movies.itertuples():
-            if movie.title == movie_title:
-                continue
-            metadata = fetch_movie_metadata(movie.id)
-            genres = set(metadata["genres"])
-            # Jaccard similarity for genres
-            intersection = len(target_genres & genres)
-            union = len(target_genres | genres)
-            sim = intersection / union if union > 0 else 0
-            similarities.append((movie.id, movie.title, sim))
+def recommend_content_based(movie_title: str, movies: pd.DataFrame, similarity: np.ndarray) -> Tuple[List[str], List[str]]:
+    engine = RecommendationEngine(movies, similarity)
+    return engine.content_based_similarity(movie_title)
 
-        # Sort by similarity and select top recommendations
-        similarities = sorted(similarities, key=lambda x: x[2], reverse=True)[
-            :num_recommendations
-        ]
-        recommended_names = [title for _, title, _ in similarities]
-        recommended_posters = [
-            fetch_poster(movie_id) for movie_id, _, _ in similarities
-        ]
-        return recommended_names, recommended_posters
+def recommend_content_based_tmdb(movie_title: str, movies: pd.DataFrame, num_recommendations: int = 5) -> Tuple[List[str], List[str]]:
+    engine = RecommendationEngine(movies)
+    return engine.content_based_tmdb(movie_title, num_recommendations)
 
-    except IndexError:
-        st.error(f"Movie '{movie_title}' not found in the database.")
-        return [], []
-    except Exception as e:
-        st.error(f"Error generating TMDB-based content recommendations: {e}")
-        return [], []
+def recommend_collaborative(user_id: int, movies: pd.DataFrame, svd_model) -> Tuple[List[str], List[str]]:
+    engine = RecommendationEngine(movies, svd_model=svd_model)
+    return engine.collaborative_filtering(user_id)
 
+def recommend_hybrid(movie_title: str, user_id: int, movies: pd.DataFrame, similarity: np.ndarray, svd_model) -> Tuple[List[str], List[str]]:
+    engine = RecommendationEngine(movies, similarity, svd_model)
+    return engine.hybrid_recommendations(movie_title, user_id)
 
-def recommend_collaborative(user_id, movies, svd_model):
-    if svd_model is None or movies.empty:
-        st.error("Collaborative recommendations unavailable due to missing data.")
-        return [], []
-    try:
-        # Get movies already rated by the user
-        rated_movie_ids = set()
-        if os.path.exists("user_reviews.csv"):
-            reviews_df = pd.read_csv("user_reviews.csv", header=0)
-            reviews_df["user"] = reviews_df["user"].astype(str)
-            uid = str(user_id)
-            rated_movie_ids = set(
-                reviews_df[reviews_df["user"] == uid]["movie_id"].astype(int).tolist()
-            )
+def recommend_by_mood(mood_answers: dict) -> Tuple[List[Dict], List[str]]:
+    engine = RecommendationEngine(pd.DataFrame())
+    return engine.mood_based_recommendations(mood_answers)
 
-        # Predict ratings for movies not yet rated
-        predictions = [
-            (movie_id, svd_model.predict(user_id, movie_id).est)
-            for movie_id in movies["id"]
-            if movie_id not in rated_movie_ids
-        ]
-        predictions = sorted(predictions, key=lambda x: x[1], reverse=True)
-        recommended_names = []
-        recommended_posters = []
-        for movie_id, _ in predictions[:3]:
-            movie_title = movies[movies["id"] == movie_id]["title"].iloc[0]
-            recommended_names.append(movie_title)
-            recommended_posters.append(fetch_poster(movie_id))
-        return recommended_names, recommended_posters
-    except Exception as e:
-        st.error(f"Error generating collaborative recommendations: {e}")
-        return [], []
+def get_fallback_recommendations() -> Tuple[List[str], List[str]]:
+    engine = RecommendationEngine(pd.DataFrame())
+    return engine._fallback_recommendations()
 
+def get_user_top_rated_movies(user_id: int, limit: int = 5) -> List[str]:
+    engine = RecommendationEngine(pd.DataFrame())
+    profile = engine.get_user_profile(user_id)
+    return profile.get("top_rated_movies", [])[:limit]
 
-def recommend_hybrid(
-    movie_title, user_id, movies, similarity, svd_model, num_recommendations=3, content_weight=0.5
-):
-    if movies.empty:
-        st.error("Hybrid recommendations unavailable due to missing movie data.")
-        return [], []
-
-    try:
-        # Get content-based recommendations
-        if similarity is not None:
-            content_names, content_posters = recommend_content_based(
-                movie_title, movies, similarity
-            )
-        else:
-            content_names, content_posters = recommend_content_based_tmdb(
-                movie_title, movies, num_recommendations * 2
-            )
-        content_scores = {
-            name: score
-            for name, score in zip(
-                content_names, np.linspace(1.0, 0.5, len(content_names))
-            )
-        }
-
-        # Get collaborative recommendations (SVD-based)
-        collab_names, collab_posters = recommend_collaborative(
-            user_id, movies, svd_model
-        )
-        collab_scores = {
-            name: score
-            for name, score in zip(
-                collab_names, np.linspace(1.0, 0.5, len(collab_names))
-            )
-        }
-
-        # Combine scores
-        combined_scores = {}
-        all_names = set(content_names) | set(collab_names)
-
-        for name in all_names:
-            content_score = content_scores.get(name, 0.0) * content_weight
-            collab_score = collab_scores.get(name, 0.0) * (1.0 - content_weight)
-            combined_scores[name] = content_score + collab_score
-
-        # Sort by combined score and exclude the input movie
-        filtered_scores = [
-            (name, score) for name, score in combined_scores.items() if name != movie_title
-        ]
-        top_movies = sorted(filtered_scores, key=lambda x: x[1], reverse=True)[
-            :num_recommendations
-        ]
-        recommended_names = []
-        recommended_posters = []
-        for name, _ in top_movies:
-            if name in content_names:
-                idx = content_names.index(name)
-                recommended_names.append(name)
-                recommended_posters.append(content_posters[idx])
-            elif name in collab_names:
-                idx = collab_names.index(name)
-                recommended_names.append(name)
-                recommended_posters.append(collab_posters[idx])
-            else:
-                movie_id = (
-                    movies[movies["title"] == name]["id"].iloc[0]
-                    if name in movies["title"].values
-                    else None
-                )
-                if movie_id:
-                    recommended_names.append(name)
-                    recommended_posters.append(fetch_poster(movie_id))
-
-        if not recommended_names:
-            st.warning(
-                "No hybrid recommendations found. Falling back to mood-based or popular movies."
-            )
-            if st.session_state.mood_answers:
-                movies_list = recommend_mood_based(
-                    st.session_state.mood_answers, fetch_genres()
-                )
-                return (
-                    [m["title"] for m in movies_list[:num_recommendations]],
-                    [m["poster"] for m in movies_list[:num_recommendations]],
-                )
-            popular_movies = fetch_popular_movies()
-            return (
-                [m["title"] for m in popular_movies[:num_recommendations]],
-                [m["poster"] for m in popular_movies[:num_recommendations]],
-            )
-
-        return recommended_names, recommended_posters
-
-    except IndexError:
-        st.error(f"Movie '{movie_title}' not found in the database.")
-        popular_movies = fetch_popular_movies()
-        return (
-            [m["title"] for m in popular_movies[:num_recommendations]],
-            [m["poster"] for m in popular_movies[:num_recommendations]],
-        )
-    except Exception as e:
-        st.error(f"Error generating hybrid recommendations: {e}")
-        popular_movies = fetch_popular_movies()
-        return (
-            [m["title"] for m in popular_movies[:num_recommendations]],
-            [m["poster"] for m in popular_movies[:num_recommendations]],
-        )
-
-
-def recommend_mood_based(answers, genre_map):
-    genre_ids = []
-    max_runtime = None
-    min_year = None
-    max_year = None
-    keywords = None
-    adult = False
-
-    mood_genres = {
-        "Happy": [35, 16, 12],  # Comedy, Animation, Adventure
-        "Sad": [18, 10749, 99],  # Drama, Romance, Documentary
-        "Stressed": [35, 10749, 10751],  # Comedy, Romance, Family
-        "Excited": [28, 53, 878],  # Action, Thriller, Sci-Fi
-        "Relaxed": [18, 10749, 99],  # Drama, Romance, Documentary
-        "Bored": [28, 35, 12],  # Action, Comedy, Adventure
-        "Angry": [53, 28, 18],  # Thriller, Action, Drama
-    }
-    secondary_genres = {
-        "Happy": [10751],  # Family
-        "Sad": [36],  # History
-        "Stressed": [16],  # Animation
-        "Excited": [12],  # Adventure
-        "Relaxed": [35],  # Comedy
-        "Bored": [878],  # Sci-Fi
-        "Angry": [80],  # Crime
-    }
-
-    if answers.get("mood"):
-        genre_ids.extend(mood_genres.get(answers["mood"], []))
-        genre_ids.extend(secondary_genres.get(answers["mood"], []))
-
-    if answers.get("motivation") == "Yes":
-        genre_ids.extend([18, 99])  # Drama, Documentary
-        keywords = "inspirational,motivational"
-
-    if (
-        answers.get("watching_with") in ["Kids", "Family"]
-        or answers.get("occasion") == "Family Night"
-    ):
-        genre_ids.extend([16, 10751])  # Animation, Family
-        adult = False
-    elif (
-        answers.get("occasion") == "Date Night" or answers.get("romantic") == "Yes"
-    ):
-        genre_ids.extend([10749, 35])  # Romance, Comedy
-
-    if answers.get("time"):
-        if answers["time"] == "Less than 1 hour":
-            max_runtime = 90
-        elif answers["time"] == "1-2 hours":
-            max_runtime = 120
-        elif answers["time"] == "2+ hours":
-            max_runtime = 180
-
-    if answers.get("genre"):
-        genre_id = [k for k, v in genre_map.items() if v == answers["genre"]]
-        if genre_id:
-            genre_ids.append(genre_id[0])
-
-    tone_genres = {
-        "Light-hearted": [35, 10749],  # Comedy, Romance
-        "Serious": [18, 36],  # Drama, History
-        "Emotional": [18, 10749],  # Drama, Romance
-        "Fun": [35, 12],  # Comedy, Adventure
-        "Epic": [12, 28],  # Adventure, Action
-        "Thought-provoking": [18, 99],  # Drama, Documentary
-    }
-    if answers.get("tone"):
-        genre_ids.extend(tone_genres.get(answers["tone"], []))
-
-    if answers.get("release"):
-        if answers["release"] == "New (post-2010)":
-            min_year = 2010
-        elif answers["release"] == "Classics (pre-2010)":
-            max_year = 2010
-
-    if answers.get("mature") == "No":
-        adult = False
-    elif answers.get("mature") == "Yes":
-        adult = True
-
-    # Remove duplicates and limit genres
-    genre_ids = list(set(genre_ids))[:3]
-
-    # Fallback genres if none selected
-    if not genre_ids:
-        genre_ids = [35, 18]  # Comedy, Drama
-
-    # Unique cache key for diversity
-    cache_key = str(uuid.uuid4()) + str(answers)
-
-    return fetch_mood_based_movies(
-        cache_key, genre_ids, max_runtime, min_year, max_year, keywords, adult
-    )
-
-
-@st.cache_data
-def fetch_mood_based_movies(
-    _cache_key,
-    genre_ids,
-    max_runtime=None,
-    min_year=None,
-    max_year=None,
-    keywords=None,
-    adult=False,
-):
-    from .api_calls import TMDB_API_KEY
-    import requests
-    from requests.adapters import HTTPAdapter
-    from urllib3.util.retry import Retry
-
-    movies_list = []
-    base_url = f"https://api.themoviedb.org/3/discover/movie?api_key={TMDB_API_KEY}&language=en-US&sort_by=vote_average.desc&vote_count.gte=100"
-
-    # Construct query parameters
-    query_params = []
-    if genre_ids:
-        query_params.append(f"with_genres={','.join(map(str, genre_ids))}")
-    query_params.append(f"include_adult={adult}")
-
-    # Try multiple query variations for diversity
-    attempts = [
-        # Full query
-        query_params
-        + (
-            ([f"with_runtime.lte={max_runtime}"] if max_runtime else [])
-            + ([f"primary_release_date.gte={min_year}-01-01"] if min_year else [])
-            + ([f"primary_release_date.lte={max_year}-12-31"] if max_year else [])
-            + ([f"with_keywords={keywords}"] if keywords else [])
-            + ["page=1"]
-        ),
-        # Relax runtime and keywords
-        query_params
-        + (
-            ([f"primary_release_date.gte={min_year}-01-01"] if min_year else [])
-            + ([f"primary_release_date.lte={max_year}-12-31"] if max_year else [])
-            + ["page=1"]
-        ),
-        # Random page for diversity
-        query_params
-        + (
-            ([f"primary_release_date.gte={min_year}-01-01"] if min_year else [])
-            + ([f"primary_release_date.lte={max_year}-12-31"] if max_year else [])
-            + [f"page={np.random.randint(1, 5)}"]
-        ),
-        # Broad query
-        query_params + ["page=1"],
-    ]
-
-    for params in attempts:
-        url = base_url + "&" + "&".join(params)
-        try:
-            session = requests.Session()
-            retries = Retry(
-                total=3,
-                backoff_factor=1,
-                status_forcelist=[204, 429, 500, 502, 503, 504],
-            )
-            session.mount("https://", HTTPAdapter(max_retries=retries))
-            response = session.get(url, timeout=5)
-            if response.status_code != 200:
-                continue
-            data = response.json()
-            if not isinstance(data, dict) or "results" not in data:
-                continue
-            for movie in data.get("results", [])[:5]:
-                movies_list.append(
-                    {
-                        "id": movie.get("id", 0),
-                        "title": movie.get("title", "Unknown"),
-                        "rating": movie.get("vote_average", 0.0),
-                        "description": movie.get(
-                            "overview", "No description available"
-                        ),
-                        "poster": f"https://image.tmdb.org/t/p/w500/{movie.get('poster_path')}"
-                        if movie.get("poster_path")
-                        else "https://via.placeholder.com/200x300?text=No+Poster",
-                        "runtime": movie.get("runtime", 120),
-                        "release_date": movie.get("release_date", "2000-01-01"),
-                        "genres": movie.get("genre_ids", []),
-                    }
-                )
-            if movies_list:
-                # Shuffle for diversity
-                np.random.shuffle(movies_list)
-                return movies_list[:5]
-        except Exception as e:
-            continue
-
-    # Fallback to popular movies with warning
-    st.warning(
-        "No movies found matching your mood-based criteria. Showing popular movies."
-    )
-    return fetch_popular_movies()
+def get_similar_movies_by_genre(genre_id: int, limit: int = 5) -> Tuple[List[str], List[str]]:
+    engine = RecommendationEngine(pd.DataFrame())
+    return engine.genre_based_recommendations(genre_id, limit)

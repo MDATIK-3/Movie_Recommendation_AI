@@ -2,11 +2,13 @@ import streamlit as st
 from components.ui_components import custom_css, navigation_bar
 from components.file_handling import load_pickles, load_watchlist_from_csv
 from components.user_management import load_users
+from components.auth_manager import restore_auth_session
 from pages import home, discover, mood, watchlist, history, signin
 
 movies, similarity, svd_model = load_pickles()
 custom_css()
 
+# Initialize session state variables with proper defaults
 if "page" not in st.session_state:
     st.session_state.page = "home"
 if "selected_genre" not in st.session_state:
@@ -29,7 +31,18 @@ if "mood_answers" not in st.session_state:
     st.session_state.mood_answers = {}
 if "mood_recommendations" not in st.session_state:
     st.session_state.mood_recommendations = []
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
 
+# Restore authentication from file if session is empty
+if not st.session_state.current_user and not st.session_state.authenticated:
+    auth_data = restore_auth_session()
+    if auth_data:
+        st.session_state.current_user = auth_data["user_id"]
+        st.session_state.current_username = auth_data["username"]
+        st.session_state.authenticated = True
+
+# Load watchlist if user is authenticated
 if st.session_state.current_user and not st.session_state.watchlist:
     st.session_state.watchlist = load_watchlist_from_csv(st.session_state.current_user)
 
